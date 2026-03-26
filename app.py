@@ -6,6 +6,13 @@ from difflib import get_close_matches
 st.set_page_config(page_title="Finance Agent", layout="wide")
 st.title("💰 Personal Finance Agent")
 
+# ---- Bank Statement Announcement Banner ----
+st.info(
+    "🏦 **This app reads real bank statements!**  \n"
+    "Upload a CSV exported directly from your bank (e.g., Chase, Bank of America, Wells Fargo, etc.).  \n"
+    "The agent will automatically detect your transaction columns — no reformatting needed."
+)
+
 # ---- Session state ----
 for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_output"]:
     if key not in st.session_state:
