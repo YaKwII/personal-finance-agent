@@ -4,6 +4,7 @@ import pdfplumber
 import re
 import io
 from difflib import get_close_matches
+import google.generativeai as genai
 
 # ---- Page setup ----
 st.set_page_config(page_title="Finance Agent", layout="wide")
@@ -17,34 +18,44 @@ st.info(
     "The agent automatically detects your transaction columns — no reformatting needed."
 )
 
+# ---- Gemini API Key (sidebar) ----
+with st.sidebar:
+    st.header("🤖 AI Settings")
+    gemini_key = st.text_input(
+        "Google Gemini API Key",
+        type="password",
+        placeholder="Paste your Gemini API key here",
+        help="Get a free key at https://aistudio.google.com/app/apikey"
+    )
+    st.caption("Your key is never stored or sent anywhere except Google's API.")
+    if gemini_key:
+        genai.configure(api_key=gemini_key)
+        st.success("✅ Gemini connected!")
+    else:
+        st.warning("⚠️ Add your Gemini key to unlock the AI Critic.")
+
 # ---- Session state ----
-for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_output"]:
+for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_output", "chat_history"]:
     if key not in st.session_state:
         st.session_state[key] = None
+if st.session_state.chat_history is None:
+    st.session_state.chat_history = []
 
 # ============================================================
 # PDF PARSING HELPER
 # ============================================================
 
 def parse_pdf_statement(uploaded_file):
-    """
-    Universal bank PDF parser.
-    Strategy:
-      1. Try pdfplumber table extraction (works for most banks).
-      2. Fall back to line-by-line regex parsing for text-only PDFs.
-    Returns a raw DataFrame or None.
-    """
     rows = []
     file_bytes = uploaded_file.read()
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        # ── Pass 1: structured table extraction ──
+        # Pass 1: structured table extraction
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
                 if not table:
                     continue
-                # First non-empty row is treated as header
                 header = [str(c).strip() if c else f"col_{i}" for i, c in enumerate(table[0])]
                 for row in table[1:]:
                     if any(cell and str(cell).strip() for cell in row):
@@ -53,15 +64,12 @@ def parse_pdf_statement(uploaded_file):
         if rows:
             return pd.DataFrame(rows)
 
-        # ── Pass 2: regex line parser (text-only PDFs) ──
-        # Pattern: date  description  optional-debit  optional-credit  balance
-        # Handles formats like:  03/15/2024  WALMART #1234  -52.43  1,234.56
+        # Pass 2: regex line parser fallback
         date_pat  = r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})'
         money_pat = r'(-?\$?[\d,]+\.\d{2})'
         line_re   = re.compile(
             rf'^{date_pat}\s+(.+?)\s+{money_pat}(?:\s+{money_pat})?(?:\s+{money_pat})?\s*$'
         )
-
         for page in pdf.pages:
             text = page.extract_text() or ""
             for line in text.splitlines():
@@ -70,15 +78,9 @@ def parse_pdf_statement(uploaded_file):
                 if m:
                     date, desc = m.group(1), m.group(2).strip()
                     amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
-                    # Use the first money value as Amount; last as Balance if present
                     raw_amt = amounts[0].replace('$', '').replace(',', '') if amounts else '0'
                     balance = amounts[-1].replace('$', '').replace(',', '') if len(amounts) > 1 else ''
-                    rows.append({
-                        'Date': date,
-                        'Description': desc,
-                        'Amount': raw_amt,
-                        'Balance': balance
-                    })
+                    rows.append({'Date': date, 'Description': desc, 'Amount': raw_amt, 'Balance': balance})
 
     return pd.DataFrame(rows) if rows else None
 
@@ -89,29 +91,25 @@ def parse_pdf_statement(uploaded_file):
 
 class DataFetcherAgent:
     """Agent 1 – loads & normalises CSV or PDF bank statements."""
-
     def fetch_data(self, uploaded_file):
         filename = uploaded_file.name.lower()
 
-        # ── Route by file type ──
         if filename.endswith(".pdf"):
             st.info("📄 PDF detected — running bank statement parser...")
             df = parse_pdf_statement(uploaded_file)
             if df is None or df.empty:
                 st.error(
                     "❌ Could not extract transactions from this PDF.  \n"
-                    "Make sure it is a **text-based PDF** (not a scanned image).  \n"
-                    "Try downloading the statement again from your bank's website."
+                    "Make sure it is a text-based PDF (not a scanned image)."
                 )
                 return None
-            st.success(f"✅ PDF parsed! Found {len(df)} rows across {len(df.columns)} columns.")
+            st.success(f"✅ PDF parsed! Found {len(df)} rows.")
         else:
             df = pd.read_csv(uploaded_file)
 
         st.subheader("📊 File Preview")
         st.dataframe(df.head(10), use_container_width=True)
 
-        # ── Column normalisation (same logic for both CSV & PDF) ──
         money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total", "txn_amt", "withdrawal", "deposit"]
         desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name", "memo", "details", "transaction"]
         date_keys    = ["date", "period", "trans", "posted", "value date"]
@@ -129,7 +127,7 @@ class DataFetcherAgent:
                         return col
             return None
 
-        cols = list(df.columns)
+        cols        = list(df.columns)
         amount_col  = find_best(cols, money_keys)
         desc_col    = find_best(cols, desc_keys)
         date_col    = find_best(cols, date_keys)
@@ -150,10 +148,9 @@ class DataFetcherAgent:
         df = df.rename(columns=rename_map)
 
         if "Amount" not in df.columns or "Description" not in df.columns:
-            st.error("❌ Could not find Amount/Description columns. The PDF layout may be unsupported.")
+            st.error("❌ Could not find Amount/Description columns.")
             return None
 
-        # Clean Amount column: remove $, commas, convert to float
         df["Amount"] = (
             df["Amount"].astype(str)
             .str.replace(r'[\$,]', '', regex=True)
@@ -243,7 +240,14 @@ class PlannerAgent:
 
 
 class CriticAgent:
-    """Agent 4 – reviews the plan and flags risks."""
+    """
+    Agent 4 – AI-powered knowledge agent.
+    - Auto-critique: flags risks in the financial data.
+    - Q&A chat: answers any finance question using Gemini,
+      with the user's own statement data baked into the context.
+    """
+
+    # ---- Auto risk critique (no AI needed) ----
     def critique(self, plan_text, df):
         if df is None:
             return "No data available for risk analysis."
@@ -252,28 +256,72 @@ class CriticAgent:
 
         if "Account" in df.columns:
             total_exp = df.loc[df["Account"].str.lower() == "expenses", "Amount"].sum()
+            income    = df.loc[df["Account"].str.lower() == "income",   "Amount"].sum()
         else:
             total_exp = df.loc[df["Amount"] < 0, "Amount"].sum()
+            income    = df.loc[df["Amount"] > 0, "Amount"].sum()
+
         total_exp = abs(total_exp)
+        net = income - total_exp
 
         if total_exp > 20000:
             risks.append("⚠️ **High expenses detected** – review your biggest categories.")
-
-        if "Account" in df.columns:
-            income = df.loc[df["Account"].str.lower() == "income", "Amount"].sum()
-        else:
-            income = df.loc[df["Amount"] > 0, "Amount"].sum()
-
         if income == 0:
             risks.append("⚠️ **No income rows found** – make sure your statement includes deposits.")
-
-        net = income - total_exp
         if net < 0:
             risks.append(f"⚠️ **Negative net (${net:,.2f})** – you are spending more than you earn!")
 
         feedback = "### 🧐 Critic Review\n\n"
         feedback += "\n".join(risks) if risks else "✅ Plan looks solid! No major risks detected."
         return feedback.strip()
+
+    # ---- AI Q&A using Gemini ----
+    def ask_ai(self, question, df, api_key):
+        if not api_key:
+            return "❌ Please add your Gemini API key in the sidebar to use the AI Critic."
+
+        # Build a financial context summary from the user's data
+        if df is not None and not df.empty:
+            if "Account" in df.columns:
+                income   = df.loc[df["Account"].str.lower() == "income",   "Amount"].sum()
+                expenses = df.loc[df["Account"].str.lower() == "expenses", "Amount"].sum()
+            else:
+                income   = df.loc[df["Amount"] > 0, "Amount"].sum()
+                expenses = df.loc[df["Amount"] < 0, "Amount"].sum()
+
+            expenses_abs = abs(expenses)
+            net = income - expenses_abs
+            top_desc = (
+                df[df["Amount"] < 0]
+                .nlargest(5, "Amount", keep="all")["Description"]
+                .tolist()
+            ) if "Description" in df.columns else []
+
+            data_context = (
+                f"The user's bank statement shows:\n"
+                f"- Total income: ${income:,.2f}\n"
+                f"- Total expenses: ${expenses_abs:,.2f}\n"
+                f"- Net balance: ${net:,.2f}\n"
+                f"- Top transactions: {', '.join(str(d) for d in top_desc)}\n"
+            )
+        else:
+            data_context = "No bank statement has been uploaded yet."
+
+        system_prompt = (
+            "You are an expert personal finance advisor and AI critic agent embedded in a finance app. "
+            "You have access to the user's real bank statement data shown below. "
+            "Answer the user's question clearly, helpfully, and in plain English. "
+            "Give specific, actionable advice based on their actual numbers when possible.\n\n"
+            f"{data_context}"
+        )
+
+        try:
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(f"{system_prompt}\n\nUser question: {question}")
+            return response.text
+        except Exception as e:
+            return f"❌ Gemini error: {str(e)}"
 
 
 class ControllerAgent:
@@ -387,5 +435,38 @@ if st.session_state.critique:
 if st.session_state.controller_output:
     st.subheader("🤖 Controller Output")
     st.markdown(st.session_state.controller_output)
+
+# ============================================================
+# AI CRITIC CHAT (Section 4)
+# ============================================================
+
+st.header("🧐 4️⃣ Ask the AI Critic")
+st.caption(
+    "Ask anything about your finances — the AI Critic reads your actual statement data and answers like a personal finance advisor."
+)
+
+# Display chat history
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# Chat input
+user_q = st.chat_input("Ask a finance question... e.g. 'Why are my expenses so high?' or 'How do I save more?'")
+if user_q:
+    # Show user message
+    st.session_state.chat_history.append({"role": "user", "content": user_q})
+    with st.chat_message("user"):
+        st.markdown(user_q)
+
+    # Get AI response
+    with st.chat_message("assistant"):
+        with st.spinner("🧐 AI Critic is thinking..."):
+            answer = critic.ask_ai(
+                user_q,
+                st.session_state.analyzed_df or st.session_state.df,
+                gemini_key
+            )
+        st.markdown(answer)
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 st.caption("CIS 4394 – Multi-Agent Finance App ❤️")
