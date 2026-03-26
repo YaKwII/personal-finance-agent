@@ -6,6 +6,15 @@ import io
 from difflib import get_close_matches
 import google.generativeai as genai
 
+# OCR imports (for scanned image-based PDFs)
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
 # ---- Page setup ----
 st.set_page_config(page_title="Finance Agent", layout="wide")
 st.title("💰 Personal Finance Agent")
@@ -15,6 +24,7 @@ st.info(
     "🏦 **This app reads real bank statements!**  \n"
     "Upload a **PDF or CSV** exported directly from your bank "
     "(Chase, Bank of America, Wells Fargo, Navy Federal, Citi, Capital One, etc.).  \n"
+    "Supports both **digital PDFs** and **scanned paper statements** (OCR).  \n"
     "The agent automatically detects your transaction columns — no reformatting needed."
 )
 
@@ -34,6 +44,20 @@ with st.sidebar:
     else:
         st.warning("⚠️ Add your Gemini key to unlock the AI Critic.")
 
+    st.divider()
+    st.header("📷 OCR Settings")
+    if OCR_AVAILABLE:
+        st.success("✅ OCR ready (pytesseract installed)")
+    else:
+        st.warning("⚠️ OCR not available. Run: pip install pytesseract pdf2image")
+    tesseract_path = st.text_input(
+        "Tesseract Path (Windows only)",
+        placeholder=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        help="Leave blank on Mac/Linux. On Windows, paste the path to tesseract.exe"
+    )
+    if tesseract_path:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
 # ---- Session state ----
 for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_output", "chat_history"]:
     if key not in st.session_state:
@@ -42,7 +66,7 @@ if st.session_state.chat_history is None:
     st.session_state.chat_history = []
 
 # ============================================================
-# PDF PARSING HELPER — supports Navy Federal + all major banks
+# HELPERS
 # ============================================================
 
 def clean_amount(raw):
@@ -58,10 +82,8 @@ def clean_amount(raw):
     s = str(raw).strip().replace(',', '').replace('$', '').replace(' ', '')
     if not s:
         return None
-    # trailing minus → negative  (Navy Federal style: "23.43-")
     if s.endswith('-'):
         s = '-' + s[:-1]
-    # parentheses → negative  e.g. (23.43)
     s = re.sub(r'^\((.+)\)$', r'-\1', s)
     try:
         return float(s)
@@ -69,13 +91,76 @@ def clean_amount(raw):
         return None
 
 
+def ocr_pdf_to_text(file_bytes):
+    """
+    Convert a scanned (image-based) PDF to text using OCR.
+    Each page is rendered as an image, then pytesseract reads it.
+    Returns a single string with all pages joined.
+    """
+    if not OCR_AVAILABLE:
+        return None
+    try:
+        images = convert_from_bytes(file_bytes, dpi=300)
+        full_text = ""
+        for img in images:
+            full_text += pytesseract.image_to_string(img) + "\n"
+        return full_text
+    except Exception as e:
+        st.warning(f"⚠️ OCR failed: {e}")
+        return None
+
+
+def parse_text_to_transactions(text):
+    """
+    Parse raw text (from OCR or pdfplumber fallback) into transaction rows
+    using regex. Handles multiple date formats and amount styles.
+    """
+    rows = []
+    # Matches: MM-DD, MM/DD, MM-DD-YYYY, MM/DD/YYYY, Mon DD
+    date_pat  = r'(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})'
+    money_pat = r'(-?\$?[\d,]+\.\d{2}-?)'
+    line_re   = re.compile(
+        rf'^{date_pat}\s+(.+?)\s+{money_pat}(?:\s+{money_pat})?(?:\s+{money_pat})?\s*$'
+    )
+    for line in text.splitlines():
+        line = line.strip()
+        m = line_re.match(line)
+        if m:
+            date = m.group(1)
+            desc = m.group(2).strip()
+            raw_amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
+            amt = clean_amount(raw_amounts[0]) if raw_amounts else None
+            bal = clean_amount(raw_amounts[-1]) if len(raw_amounts) > 1 else None
+            if amt is None:
+                continue
+            # Skip header rows OCR might misread as transactions
+            if desc.lower() in ["transaction detail", "description", "details"]:
+                continue
+            rows.append({"Date": date, "Description": desc, "Amount": amt, "Balance": bal})
+    return rows
+
+
+def is_text_pdf(file_bytes):
+    """Check if a PDF has real embedded text (not just images)."""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            if len(text.strip()) > 50:  # meaningful text found
+                return True
+    return False
+
+
+# ============================================================
+# PDF PARSING — 3-strategy pipeline
+# ============================================================
+
 def parse_pdf_statement(uploaded_file):
     """
-    Extract transactions from a PDF bank statement.
+    Extract transactions from any PDF bank statement.
 
-    Strategy 1 — Structured table extraction (Chase, BofA, Wells Fargo,
-                  Citi, Capital One, Navy Federal, etc.)
-    Strategy 2 — Line-by-line regex fallback for non-table PDFs.
+    Strategy 1 — Structured table extraction  (digital PDFs with tables)
+    Strategy 2 — Line-by-line regex            (digital PDFs, no tables)
+    Strategy 3 — OCR + regex                   (scanned paper statements)
 
     Returns a cleaned DataFrame with columns:
         Date | Description | Amount | Balance
@@ -83,25 +168,20 @@ def parse_pdf_statement(uploaded_file):
     rows = []
     file_bytes = uploaded_file.read()
 
+    # --------------------------------------------------------
+    # STRATEGY 1 — structured table extraction
+    # --------------------------------------------------------
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-
-        # ----------------------------------------------------------
-        # STRATEGY 1 — structured tables
-        # ----------------------------------------------------------
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
                 if not table or len(table) < 2:
                     continue
-
-                # Build header list, replace None with positional placeholder
                 raw_header = table[0]
                 header = [
                     str(c).strip().lower() if c else f"col_{i}"
                     for i, c in enumerate(raw_header)
                 ]
-
-                # Skip summary / deposit-voucher tables that have no date column
                 has_date = any(
                     any(k in h for k in ["date", "col_0"]) for h in header
                 )
@@ -110,60 +190,43 @@ def parse_pdf_statement(uploaded_file):
 
                 for row in table[1:]:
                     if not any(cell and str(cell).strip() for cell in row):
-                        continue  # skip blank rows
+                        continue
                     row_dict = {
                         header[i]: str(cell).strip() if cell else ""
                         for i, cell in enumerate(row)
                         if i < len(header)
                     }
-
-                    # --- map to standard column names ---
-                    date_val = ""
-                    desc_val = ""
-                    amt_val  = ""
-                    bal_val  = ""
-
+                    date_val = desc_val = amt_val = bal_val = ""
                     for k, v in row_dict.items():
-                        if any(x in k for x in ["date"]):
+                        if "date" in k:
                             date_val = v
-                        elif any(x in k for x in ["transaction detail", "description",
-                                                   "memo", "merchant", "payee",
-                                                   "details", "desc", "name"]):
+                        elif any(x in k for x in ["transaction detail", "description", "memo",
+                                                   "merchant", "payee", "details", "desc", "name"]):
                             desc_val = v
                         elif any(x in k for x in ["amount($)", "amount", "debit",
                                                    "withdrawal", "charge"]):
-                            if not amt_val:   # take first match
+                            if not amt_val:
                                 amt_val = v
                         elif any(x in k for x in ["balance($)", "balance"]):
                             bal_val = v
 
-                    # Navy Federal: columns are "Date", "Transaction Detail",
-                    # "Amount($)", "Balance($)" — handle col_* fallback
-                    if not date_val and "col_0" in row_dict:
-                        date_val = row_dict["col_0"]
-                    if not desc_val and "col_1" in row_dict:
-                        desc_val = row_dict["col_1"]
-                    if not amt_val and "col_2" in row_dict:
-                        amt_val = row_dict["col_2"]
-                    if not bal_val and "col_3" in row_dict:
-                        bal_val = row_dict["col_3"]
+                    if not date_val and "col_0" in row_dict: date_val = row_dict["col_0"]
+                    if not desc_val and "col_1" in row_dict: desc_val = row_dict["col_1"]
+                    if not amt_val  and "col_2" in row_dict: amt_val  = row_dict["col_2"]
+                    if not bal_val  and "col_3" in row_dict: bal_val  = row_dict["col_3"]
 
-                    # Skip header-repeat rows, beginning/ending balance rows
                     if not date_val or date_val.lower() in ["date", ""]:
                         continue
                     if desc_val.lower() in ["beginning balance", "ending balance",
                                             "transaction detail"]:
                         continue
-
-                    # Must look like a real date
                     if not re.search(r'\d{1,2}[-/]\d{1,2}', date_val):
                         continue
 
                     cleaned_amt = clean_amount(amt_val)
                     cleaned_bal = clean_amount(bal_val)
-
                     if cleaned_amt is None:
-                        continue  # skip rows with no numeric amount
+                        continue
 
                     rows.append({
                         "Date":        date_val,
@@ -172,37 +235,46 @@ def parse_pdf_statement(uploaded_file):
                         "Balance":     cleaned_bal,
                     })
 
+    if rows:
+        df = pd.DataFrame(rows)
+        df["Amount"]  = pd.to_numeric(df["Amount"],  errors="coerce")
+        df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
+        return df
+
+    # --------------------------------------------------------
+    # STRATEGY 2 — line-by-line regex (digital, no tables)
+    # --------------------------------------------------------
+    if is_text_pdf(file_bytes):
+        st.info("📝 No tables found — trying line-by-line text parser...")
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            full_text = ""
+            for page in pdf.pages:
+                full_text += (page.extract_text() or "") + "\n"
+        rows = parse_text_to_transactions(full_text)
         if rows:
-            df = pd.DataFrame(rows)
-            df["Amount"]  = pd.to_numeric(df["Amount"],  errors="coerce")
-            df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
-            return df
+            return pd.DataFrame(rows)
 
-        # ----------------------------------------------------------
-        # STRATEGY 2 — regex line parser (fallback for non-table PDFs)
-        # ----------------------------------------------------------
-        date_pat  = r'(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)'
-        money_pat = r'(-?\$?[\d,]+\.\d{2}-?)'
-        line_re   = re.compile(
-            rf'^{date_pat}\s+(.+?)\s+{money_pat}(?:\s+{money_pat})?(?:\s+{money_pat})?\s*$'
+    # --------------------------------------------------------
+    # STRATEGY 3 — OCR (scanned image-based PDFs)
+    # --------------------------------------------------------
+    if OCR_AVAILABLE:
+        st.info("📷 No text found in PDF — running OCR on scanned pages (this may take 10–30 seconds)...")
+        ocr_text = ocr_pdf_to_text(file_bytes)
+        if ocr_text:
+            rows = parse_text_to_transactions(ocr_text)
+            if rows:
+                st.success("✅ OCR complete! Transactions extracted from scanned statement.")
+                return pd.DataFrame(rows)
+        st.error("❌ OCR ran but could not extract transactions. The scan quality may be too low.")
+    else:
+        st.error(
+            "❌ This appears to be a scanned PDF (image-based), but OCR is not installed.  \n"
+            "To enable scanned statement support, run:  \n"
+            "`pip install pytesseract pdf2image`  \n"
+            "and install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki"
         )
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf2:
-            for page in pdf2.pages:
-                text = page.extract_text() or ""
-                for line in text.splitlines():
-                    line = line.strip()
-                    m = line_re.match(line)
-                    if m:
-                        date, desc = m.group(1), m.group(2).strip()
-                        raw_amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
-                        amt = clean_amount(raw_amounts[0]) if raw_amounts else None
-                        bal = clean_amount(raw_amounts[-1]) if len(raw_amounts) > 1 else None
-                        if amt is None:
-                            continue
-                        rows.append({"Date": date, "Description": desc,
-                                     "Amount": amt, "Balance": bal})
 
-    return pd.DataFrame(rows) if rows else None
+    return None
 
 
 # ============================================================
@@ -220,7 +292,7 @@ class DataFetcherAgent:
             if df is None or df.empty:
                 st.error(
                     "❌ Could not extract transactions from this PDF.  \n"
-                    "Make sure it is a text-based PDF (not a scanned image)."
+                    "Make sure it is a text-based PDF (not a scanned image) or install pytesseract for OCR support."
                 )
                 return None
             st.success(f"✅ PDF parsed! Found {len(df)} transaction rows.")
@@ -230,12 +302,10 @@ class DataFetcherAgent:
         st.subheader("📊 File Preview")
         st.dataframe(df.head(15), use_container_width=True)
 
-        # For PDFs already cleaned, columns are standardised — skip fuzzy matching
         if filename.endswith(".pdf") and "Amount" in df.columns:
             st.session_state.df = df
             return df
 
-        # CSV fuzzy column matching
         money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total",
                         "txn_amt", "withdrawal", "deposit"]
         desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name",
@@ -371,8 +441,7 @@ class CriticAgent:
     """
     Agent 4 – AI-powered knowledge agent.
     - Auto-critique: flags risks in the financial data.
-    - Q&A chat: answers any finance question using Gemini,
-      with the user's own statement data baked into the context.
+    - Q&A chat: answers any finance question using Gemini.
     """
 
     def critique(self, plan_text, df):
