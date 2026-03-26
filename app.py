@@ -1,5 +1,8 @@
 import streamlit as st
 import pandas as pd
+import pdfplumber
+import re
+import io
 from difflib import get_close_matches
 
 # ---- Page setup ----
@@ -9,8 +12,9 @@ st.title("💰 Personal Finance Agent")
 # ---- Bank Statement Announcement Banner ----
 st.info(
     "🏦 **This app reads real bank statements!**  \n"
-    "Upload a CSV exported directly from your bank (e.g., Chase, Bank of America, Wells Fargo, etc.).  \n"
-    "The agent will automatically detect your transaction columns — no reformatting needed."
+    "Upload a **PDF or CSV** exported directly from your bank "
+    "(Chase, Bank of America, Wells Fargo, Citi, Capital One, etc.).  \n"
+    "The agent automatically detects your transaction columns — no reformatting needed."
 )
 
 # ---- Session state ----
@@ -19,27 +23,106 @@ for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_outp
         st.session_state[key] = None
 
 # ============================================================
+# PDF PARSING HELPER
+# ============================================================
+
+def parse_pdf_statement(uploaded_file):
+    """
+    Universal bank PDF parser.
+    Strategy:
+      1. Try pdfplumber table extraction (works for most banks).
+      2. Fall back to line-by-line regex parsing for text-only PDFs.
+    Returns a raw DataFrame or None.
+    """
+    rows = []
+    file_bytes = uploaded_file.read()
+
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        # ── Pass 1: structured table extraction ──
+        for page in pdf.pages:
+            tables = page.extract_tables()
+            for table in tables:
+                if not table:
+                    continue
+                # First non-empty row is treated as header
+                header = [str(c).strip() if c else f"col_{i}" for i, c in enumerate(table[0])]
+                for row in table[1:]:
+                    if any(cell and str(cell).strip() for cell in row):
+                        rows.append(dict(zip(header, [str(c).strip() if c else "" for c in row])))
+
+        if rows:
+            return pd.DataFrame(rows)
+
+        # ── Pass 2: regex line parser (text-only PDFs) ──
+        # Pattern: date  description  optional-debit  optional-credit  balance
+        # Handles formats like:  03/15/2024  WALMART #1234  -52.43  1,234.56
+        date_pat  = r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})'
+        money_pat = r'(-?\$?[\d,]+\.\d{2})'
+        line_re   = re.compile(
+            rf'^{date_pat}\s+(.+?)\s+{money_pat}(?:\s+{money_pat})?(?:\s+{money_pat})?\s*$'
+        )
+
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                line = line.strip()
+                m = line_re.match(line)
+                if m:
+                    date, desc = m.group(1), m.group(2).strip()
+                    amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
+                    # Use the first money value as Amount; last as Balance if present
+                    raw_amt = amounts[0].replace('$', '').replace(',', '') if amounts else '0'
+                    balance = amounts[-1].replace('$', '').replace(',', '') if len(amounts) > 1 else ''
+                    rows.append({
+                        'Date': date,
+                        'Description': desc,
+                        'Amount': raw_amt,
+                        'Balance': balance
+                    })
+
+    return pd.DataFrame(rows) if rows else None
+
+
+# ============================================================
 # AGENT CLASSES
 # ============================================================
 
 class DataFetcherAgent:
-    """Agent 1 – loads & normalises the CSV."""
-    def fetch_data(self, uploaded_file):
-        df = pd.read_csv(uploaded_file)
-        st.subheader("📊 File Preview")
-        st.dataframe(df.head(), use_container_width=True)
+    """Agent 1 – loads & normalises CSV or PDF bank statements."""
 
-        money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total", "txn_amt"]
-        desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name", "memo"]
-        date_keys    = ["date", "period", "trans", "posted"]
-        account_keys = ["account", "category", "type"]
+    def fetch_data(self, uploaded_file):
+        filename = uploaded_file.name.lower()
+
+        # ── Route by file type ──
+        if filename.endswith(".pdf"):
+            st.info("📄 PDF detected — running bank statement parser...")
+            df = parse_pdf_statement(uploaded_file)
+            if df is None or df.empty:
+                st.error(
+                    "❌ Could not extract transactions from this PDF.  \n"
+                    "Make sure it is a **text-based PDF** (not a scanned image).  \n"
+                    "Try downloading the statement again from your bank's website."
+                )
+                return None
+            st.success(f"✅ PDF parsed! Found {len(df)} rows across {len(df.columns)} columns.")
+        else:
+            df = pd.read_csv(uploaded_file)
+
+        st.subheader("📊 File Preview")
+        st.dataframe(df.head(10), use_container_width=True)
+
+        # ── Column normalisation (same logic for both CSV & PDF) ──
+        money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total", "txn_amt", "withdrawal", "deposit"]
+        desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name", "memo", "details", "transaction"]
+        date_keys    = ["date", "period", "trans", "posted", "value date"]
+        account_keys = ["account", "category", "type", "class"]
 
         def find_best(colnames, keywords):
             for col in colnames:
                 if any(k in col.lower() for k in keywords):
                     return col
             lower = [c.lower() for c in colnames]
-            hit = get_close_matches(" ".join(lower), keywords, n=1, cutoff=0.6)
+            hit = get_close_matches(" ".join(lower), keywords, n=1, cutoff=0.5)
             if hit:
                 for col in colnames:
                     if hit[0] in col.lower():
@@ -67,8 +150,17 @@ class DataFetcherAgent:
         df = df.rename(columns=rename_map)
 
         if "Amount" not in df.columns or "Description" not in df.columns:
-            st.error("❌ Could not find Amount/Description columns.")
+            st.error("❌ Could not find Amount/Description columns. The PDF layout may be unsupported.")
             return None
+
+        # Clean Amount column: remove $, commas, convert to float
+        df["Amount"] = (
+            df["Amount"].astype(str)
+            .str.replace(r'[\$,]', '', regex=True)
+            .str.strip()
+        )
+        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+        df = df.dropna(subset=["Amount"])
 
         st.success(
             f"✅ Columns matched!\n\n"
@@ -85,7 +177,7 @@ class AnalyzerAgent:
     """Agent 2 – computes income, expenses, and category breakdown."""
     def analyze(self, df):
         if df is None or df.empty:
-            return "No data loaded yet. Upload a CSV first.", None
+            return "No data loaded yet. Upload a file first.", None
 
         data = df.copy()
         data["Category"] = data["Account"] if "Account" in data.columns else "General"
@@ -135,8 +227,8 @@ class PlannerAgent:
         else:
             total_exp = df.loc[df["Amount"] < 0, "Amount"].sum()
 
-        total_exp     = abs(total_exp)
-        monthly_exp   = total_exp / 3.0
+        total_exp      = abs(total_exp)
+        monthly_exp    = total_exp / 3.0
         emergency_fund = monthly_exp * 3
 
         return (
@@ -158,7 +250,6 @@ class CriticAgent:
 
         risks = []
 
-        # Risk 1: very high total expenses
         if "Account" in df.columns:
             total_exp = df.loc[df["Account"].str.lower() == "expenses", "Amount"].sum()
         else:
@@ -168,16 +259,14 @@ class CriticAgent:
         if total_exp > 20000:
             risks.append("⚠️ **High expenses detected** – review your biggest categories.")
 
-        # Risk 2: no income rows found
         if "Account" in df.columns:
             income = df.loc[df["Account"].str.lower() == "income", "Amount"].sum()
         else:
             income = df.loc[df["Amount"] > 0, "Amount"].sum()
 
         if income == 0:
-            risks.append("⚠️ **No income rows found** – make sure your CSV has income data.")
+            risks.append("⚠️ **No income rows found** – make sure your statement includes deposits.")
 
-        # Risk 3: negative net worth
         net = income - total_exp
         if net < 0:
             risks.append(f"⚠️ **Negative net (${net:,.2f})** – you are spending more than you earn!")
@@ -227,22 +316,23 @@ controller = ControllerAgent()
 # UI
 # ============================================================
 
-st.header("1️⃣ Upload Your CSV")
-uploaded = st.file_uploader("Upload a CSV (e.g., john_doe_financial_report.csv)", type=["csv"])
+st.header("1️⃣ Upload Your Bank Statement")
+uploaded = st.file_uploader(
+    "Upload a PDF or CSV bank statement (Chase, BofA, Wells Fargo, Citi, Capital One, etc.)",
+    type=["csv", "pdf"]
+)
 if uploaded is not None:
     fetcher.fetch_data(uploaded)
 
 st.header("2️⃣ Run the Agents")
 col1, col2, col3, col4, col5 = st.columns(5)
 
-# --- Analyze ---
 with col1:
     if st.button("🔍 Analyze", use_container_width=True):
         summary, analyzed_df = analyzer.analyze(st.session_state.df)
         st.session_state.summary     = summary
         st.session_state.analyzed_df = analyzed_df
 
-# --- Plan ---
 with col2:
     if st.button("📈 Plan", use_container_width=True):
         if st.session_state.analyzed_df is None:
@@ -250,7 +340,6 @@ with col2:
         else:
             st.session_state.plan = planner.plan(st.session_state.analyzed_df)
 
-# --- Critique ---
 with col3:
     if st.button("🧐 Critique", use_container_width=True):
         if st.session_state.analyzed_df is None:
@@ -260,15 +349,14 @@ with col3:
                 st.session_state.plan or "", st.session_state.analyzed_df
             )
 
-# --- Controller (NL command) ---
 with col4:
     st.markdown("**🤖 Controller**")
-    cmd_input = st.text_input("Type a command", placeholder="e.g. analyze, plan, critique", label_visibility="collapsed", key="cmd_input")
+    cmd_input = st.text_input("Type a command", placeholder="e.g. analyze, plan, critique",
+                              label_visibility="collapsed", key="cmd_input")
     if st.button("▶ Run Command", use_container_width=True):
         result = controller.process(cmd_input, st.session_state.df, st.session_state.analyzed_df)
         st.session_state.controller_output = result
 
-# --- Reset ---
 with col5:
     if st.button("🔄 Reset", use_container_width=True):
         for key in list(st.session_state.keys()):
