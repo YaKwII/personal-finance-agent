@@ -5,15 +5,7 @@ import re
 import io
 from difflib import get_close_matches
 import google.generativeai as genai
-
-# OCR imports (for scanned image-based PDFs)
-try:
-    import pytesseract
-    from pdf2image import convert_from_bytes
-    from PIL import Image
-    OCR_AVAILABLE = True
-except ImportError:
-    OCR_AVAILABLE = False
+import fitz  # pymupdf — no external engine needed
 
 # ---- Page setup ----
 st.set_page_config(page_title="Finance Agent", layout="wide")
@@ -24,7 +16,7 @@ st.info(
     "🏦 **This app reads real bank statements!**  \n"
     "Upload a **PDF or CSV** exported directly from your bank "
     "(Chase, Bank of America, Wells Fargo, Navy Federal, Citi, Capital One, etc.).  \n"
-    "Supports both **digital PDFs** and **scanned paper statements** (OCR).  \n"
+    "Supports both **digital PDFs** and **scanned/image-based PDFs** (via PyMuPDF).  \n"
     "The agent automatically detects your transaction columns — no reformatting needed."
 )
 
@@ -43,20 +35,6 @@ with st.sidebar:
         st.success("✅ Gemini connected!")
     else:
         st.warning("⚠️ Add your Gemini key to unlock the AI Critic.")
-
-    st.divider()
-    st.header("📷 OCR Settings")
-    if OCR_AVAILABLE:
-        st.success("✅ OCR ready (pytesseract installed)")
-    else:
-        st.warning("⚠️ OCR not available. Run: pip install pytesseract pdf2image")
-    tesseract_path = st.text_input(
-        "Tesseract Path (Windows only)",
-        placeholder=r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        help="Leave blank on Mac/Linux. On Windows, paste the path to tesseract.exe"
-    )
-    if tesseract_path:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_path
 
 # ---- Session state ----
 for key in ["df", "analyzed_df", "summary", "plan", "critique", "controller_output", "chat_history"]:
@@ -91,32 +69,30 @@ def clean_amount(raw):
         return None
 
 
-def ocr_pdf_to_text(file_bytes):
+def pymupdf_extract_text(file_bytes):
     """
-    Convert a scanned (image-based) PDF to text using OCR.
-    Each page is rendered as an image, then pytesseract reads it.
-    Returns a single string with all pages joined.
+    Extract all text from a PDF using PyMuPDF (fitz).
+    Works on both digital and image-based PDFs.
+    No external engine required.
     """
-    if not OCR_AVAILABLE:
-        return None
     try:
-        images = convert_from_bytes(file_bytes, dpi=300)
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
         full_text = ""
-        for img in images:
-            full_text += pytesseract.image_to_string(img) + "\n"
-        return full_text
+        for page in doc:
+            full_text += page.get_text() + "\n"
+        doc.close()
+        return full_text if full_text.strip() else None
     except Exception as e:
-        st.warning(f"⚠️ OCR failed: {e}")
+        st.warning(f"⚠️ PyMuPDF extraction failed: {e}")
         return None
 
 
 def parse_text_to_transactions(text):
     """
-    Parse raw text (from OCR or pdfplumber fallback) into transaction rows
-    using regex. Handles multiple date formats and amount styles.
+    Parse raw text into transaction rows using regex.
+    Handles multiple date formats and amount styles.
     """
     rows = []
-    # Matches: MM-DD, MM/DD, MM-DD-YYYY, MM/DD/YYYY, Mon DD
     date_pat  = r'(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2})'
     money_pat = r'(-?\$?[\d,]+\.\d{2}-?)'
     line_re   = re.compile(
@@ -133,7 +109,6 @@ def parse_text_to_transactions(text):
             bal = clean_amount(raw_amounts[-1]) if len(raw_amounts) > 1 else None
             if amt is None:
                 continue
-            # Skip header rows OCR might misread as transactions
             if desc.lower() in ["transaction detail", "description", "details"]:
                 continue
             rows.append({"Date": date, "Description": desc, "Amount": amt, "Balance": bal})
@@ -145,7 +120,7 @@ def is_text_pdf(file_bytes):
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
-            if len(text.strip()) > 50:  # meaningful text found
+            if len(text.strip()) > 50:
                 return True
     return False
 
@@ -159,8 +134,8 @@ def parse_pdf_statement(uploaded_file):
     Extract transactions from any PDF bank statement.
 
     Strategy 1 — Structured table extraction  (digital PDFs with tables)
-    Strategy 2 — Line-by-line regex            (digital PDFs, no tables)
-    Strategy 3 — OCR + regex                   (scanned paper statements)
+    Strategy 2 — pdfplumber line-by-line regex (digital PDFs, no tables)
+    Strategy 3 — PyMuPDF text extraction       (image/scanned PDFs, no extra install)
 
     Returns a cleaned DataFrame with columns:
         Date | Description | Amount | Balance
@@ -242,7 +217,7 @@ def parse_pdf_statement(uploaded_file):
         return df
 
     # --------------------------------------------------------
-    # STRATEGY 2 — line-by-line regex (digital, no tables)
+    # STRATEGY 2 — pdfplumber line-by-line (digital, no tables)
     # --------------------------------------------------------
     if is_text_pdf(file_bytes):
         st.info("📝 No tables found — trying line-by-line text parser...")
@@ -255,25 +230,21 @@ def parse_pdf_statement(uploaded_file):
             return pd.DataFrame(rows)
 
     # --------------------------------------------------------
-    # STRATEGY 3 — OCR (scanned image-based PDFs)
+    # STRATEGY 3 — PyMuPDF (scanned / image-based PDFs)
     # --------------------------------------------------------
-    if OCR_AVAILABLE:
-        st.info("📷 No text found in PDF — running OCR on scanned pages (this may take 10–30 seconds)...")
-        ocr_text = ocr_pdf_to_text(file_bytes)
-        if ocr_text:
-            rows = parse_text_to_transactions(ocr_text)
-            if rows:
-                st.success("✅ OCR complete! Transactions extracted from scanned statement.")
-                return pd.DataFrame(rows)
-        st.error("❌ OCR ran but could not extract transactions. The scan quality may be too low.")
-    else:
-        st.error(
-            "❌ This appears to be a scanned PDF (image-based), but OCR is not installed.  \n"
-            "To enable scanned statement support, run:  \n"
-            "`pip install pytesseract pdf2image`  \n"
-            "and install Tesseract: https://github.com/UB-Mannheim/tesseract/wiki"
-        )
+    st.info("📄 Trying PyMuPDF deep text extraction (no install required)...")
+    mupdf_text = pymupdf_extract_text(file_bytes)
+    if mupdf_text:
+        rows = parse_text_to_transactions(mupdf_text)
+        if rows:
+            st.success("✅ PyMuPDF extracted transactions successfully!")
+            return pd.DataFrame(rows)
 
+    st.error(
+        "❌ Could not extract transactions from this PDF.  \n"
+        "The file may be a true image scan with no readable text.  \n"
+        "Try downloading a fresh copy from your bank's website instead."
+    )
     return None
 
 
@@ -292,7 +263,7 @@ class DataFetcherAgent:
             if df is None or df.empty:
                 st.error(
                     "❌ Could not extract transactions from this PDF.  \n"
-                    "Make sure it is a text-based PDF (not a scanned image) or install pytesseract for OCR support."
+                    "Try downloading it directly from your bank's website."
                 )
                 return None
             st.success(f"✅ PDF parsed! Found {len(df)} transaction rows.")
