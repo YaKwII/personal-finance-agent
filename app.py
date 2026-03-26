@@ -14,7 +14,7 @@ st.title("💰 Personal Finance Agent")
 st.info(
     "🏦 **This app reads real bank statements!**  \n"
     "Upload a **PDF or CSV** exported directly from your bank "
-    "(Chase, Bank of America, Wells Fargo, Citi, Capital One, etc.).  \n"
+    "(Chase, Bank of America, Wells Fargo, Navy Federal, Citi, Capital One, etc.).  \n"
     "The agent automatically detects your transaction columns — no reformatting needed."
 )
 
@@ -42,45 +42,165 @@ if st.session_state.chat_history is None:
     st.session_state.chat_history = []
 
 # ============================================================
-# PDF PARSING HELPER
+# PDF PARSING HELPER — supports Navy Federal + all major banks
 # ============================================================
 
+def clean_amount(raw):
+    """
+    Convert bank amount strings to signed floats.
+    Handles:
+      - Standard negatives:  '-23.43'  or  '($23.43)'
+      - Navy Federal style:  '23.43-'  (minus at end)
+      - Plain positives:     '418.00'
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(',', '').replace('$', '').replace(' ', '')
+    if not s:
+        return None
+    # trailing minus → negative  (Navy Federal style: "23.43-")
+    if s.endswith('-'):
+        s = '-' + s[:-1]
+    # parentheses → negative  e.g. (23.43)
+    s = re.sub(r'^\((.+)\)$', r'-\1', s)
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
 def parse_pdf_statement(uploaded_file):
+    """
+    Extract transactions from a PDF bank statement.
+
+    Strategy 1 — Structured table extraction (Chase, BofA, Wells Fargo,
+                  Citi, Capital One, Navy Federal, etc.)
+    Strategy 2 — Line-by-line regex fallback for non-table PDFs.
+
+    Returns a cleaned DataFrame with columns:
+        Date | Description | Amount | Balance
+    """
     rows = []
     file_bytes = uploaded_file.read()
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        # Pass 1: structured table extraction
+
+        # ----------------------------------------------------------
+        # STRATEGY 1 — structured tables
+        # ----------------------------------------------------------
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
-                if not table:
+                if not table or len(table) < 2:
                     continue
-                header = [str(c).strip() if c else f"col_{i}" for i, c in enumerate(table[0])]
+
+                # Build header list, replace None with positional placeholder
+                raw_header = table[0]
+                header = [
+                    str(c).strip().lower() if c else f"col_{i}"
+                    for i, c in enumerate(raw_header)
+                ]
+
+                # Skip summary / deposit-voucher tables that have no date column
+                has_date = any(
+                    any(k in h for k in ["date", "col_0"]) for h in header
+                )
+                if not has_date:
+                    continue
+
                 for row in table[1:]:
-                    if any(cell and str(cell).strip() for cell in row):
-                        rows.append(dict(zip(header, [str(c).strip() if c else "" for c in row])))
+                    if not any(cell and str(cell).strip() for cell in row):
+                        continue  # skip blank rows
+                    row_dict = {
+                        header[i]: str(cell).strip() if cell else ""
+                        for i, cell in enumerate(row)
+                        if i < len(header)
+                    }
+
+                    # --- map to standard column names ---
+                    date_val = ""
+                    desc_val = ""
+                    amt_val  = ""
+                    bal_val  = ""
+
+                    for k, v in row_dict.items():
+                        if any(x in k for x in ["date"]):
+                            date_val = v
+                        elif any(x in k for x in ["transaction detail", "description",
+                                                   "memo", "merchant", "payee",
+                                                   "details", "desc", "name"]):
+                            desc_val = v
+                        elif any(x in k for x in ["amount($)", "amount", "debit",
+                                                   "withdrawal", "charge"]):
+                            if not amt_val:   # take first match
+                                amt_val = v
+                        elif any(x in k for x in ["balance($)", "balance"]):
+                            bal_val = v
+
+                    # Navy Federal: columns are "Date", "Transaction Detail",
+                    # "Amount($)", "Balance($)" — handle col_* fallback
+                    if not date_val and "col_0" in row_dict:
+                        date_val = row_dict["col_0"]
+                    if not desc_val and "col_1" in row_dict:
+                        desc_val = row_dict["col_1"]
+                    if not amt_val and "col_2" in row_dict:
+                        amt_val = row_dict["col_2"]
+                    if not bal_val and "col_3" in row_dict:
+                        bal_val = row_dict["col_3"]
+
+                    # Skip header-repeat rows, beginning/ending balance rows
+                    if not date_val or date_val.lower() in ["date", ""]:
+                        continue
+                    if desc_val.lower() in ["beginning balance", "ending balance",
+                                            "transaction detail"]:
+                        continue
+
+                    # Must look like a real date
+                    if not re.search(r'\d{1,2}[-/]\d{1,2}', date_val):
+                        continue
+
+                    cleaned_amt = clean_amount(amt_val)
+                    cleaned_bal = clean_amount(bal_val)
+
+                    if cleaned_amt is None:
+                        continue  # skip rows with no numeric amount
+
+                    rows.append({
+                        "Date":        date_val,
+                        "Description": desc_val,
+                        "Amount":      cleaned_amt,
+                        "Balance":     cleaned_bal,
+                    })
 
         if rows:
-            return pd.DataFrame(rows)
+            df = pd.DataFrame(rows)
+            df["Amount"]  = pd.to_numeric(df["Amount"],  errors="coerce")
+            df["Balance"] = pd.to_numeric(df["Balance"], errors="coerce")
+            return df
 
-        # Pass 2: regex line parser fallback
-        date_pat  = r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})'
-        money_pat = r'(-?\$?[\d,]+\.\d{2})'
+        # ----------------------------------------------------------
+        # STRATEGY 2 — regex line parser (fallback for non-table PDFs)
+        # ----------------------------------------------------------
+        date_pat  = r'(\d{1,2}[/\-]\d{1,2}(?:[/\-]\d{2,4})?)'
+        money_pat = r'(-?\$?[\d,]+\.\d{2}-?)'
         line_re   = re.compile(
             rf'^{date_pat}\s+(.+?)\s+{money_pat}(?:\s+{money_pat})?(?:\s+{money_pat})?\s*$'
         )
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                line = line.strip()
-                m = line_re.match(line)
-                if m:
-                    date, desc = m.group(1), m.group(2).strip()
-                    amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
-                    raw_amt = amounts[0].replace('$', '').replace(',', '') if amounts else '0'
-                    balance = amounts[-1].replace('$', '').replace(',', '') if len(amounts) > 1 else ''
-                    rows.append({'Date': date, 'Description': desc, 'Amount': raw_amt, 'Balance': balance})
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf2:
+            for page in pdf2.pages:
+                text = page.extract_text() or ""
+                for line in text.splitlines():
+                    line = line.strip()
+                    m = line_re.match(line)
+                    if m:
+                        date, desc = m.group(1), m.group(2).strip()
+                        raw_amounts = [g for g in [m.group(3), m.group(4), m.group(5)] if g]
+                        amt = clean_amount(raw_amounts[0]) if raw_amounts else None
+                        bal = clean_amount(raw_amounts[-1]) if len(raw_amounts) > 1 else None
+                        if amt is None:
+                            continue
+                        rows.append({"Date": date, "Description": desc,
+                                     "Amount": amt, "Balance": bal})
 
     return pd.DataFrame(rows) if rows else None
 
@@ -103,15 +223,23 @@ class DataFetcherAgent:
                     "Make sure it is a text-based PDF (not a scanned image)."
                 )
                 return None
-            st.success(f"✅ PDF parsed! Found {len(df)} rows.")
+            st.success(f"✅ PDF parsed! Found {len(df)} transaction rows.")
         else:
             df = pd.read_csv(uploaded_file)
 
         st.subheader("📊 File Preview")
-        st.dataframe(df.head(10), use_container_width=True)
+        st.dataframe(df.head(15), use_container_width=True)
 
-        money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total", "txn_amt", "withdrawal", "deposit"]
-        desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name", "memo", "details", "transaction"]
+        # For PDFs already cleaned, columns are standardised — skip fuzzy matching
+        if filename.endswith(".pdf") and "Amount" in df.columns:
+            st.session_state.df = df
+            return df
+
+        # CSV fuzzy column matching
+        money_keys   = ["amount", "cost", "price", "debit", "credit", "charge", "total",
+                        "txn_amt", "withdrawal", "deposit"]
+        desc_keys    = ["desc", "merchant", "payee", "description", "vendor", "name",
+                        "memo", "details", "transaction"]
         date_keys    = ["date", "period", "trans", "posted", "value date"]
         account_keys = ["account", "category", "type", "class"]
 
@@ -247,7 +375,6 @@ class CriticAgent:
       with the user's own statement data baked into the context.
     """
 
-    # ---- Auto risk critique (no AI needed) ----
     def critique(self, plan_text, df):
         if df is None:
             return "No data available for risk analysis."
@@ -275,12 +402,10 @@ class CriticAgent:
         feedback += "\n".join(risks) if risks else "✅ Plan looks solid! No major risks detected."
         return feedback.strip()
 
-    # ---- AI Q&A using Gemini ----
     def ask_ai(self, question, df, api_key):
         if not api_key:
             return "❌ Please add your Gemini API key in the sidebar to use the AI Critic."
 
-        # Build a financial context summary from the user's data
         if df is not None and not df.empty:
             if "Account" in df.columns:
                 income   = df.loc[df["Account"].str.lower() == "income",   "Amount"].sum()
@@ -299,10 +424,10 @@ class CriticAgent:
 
             data_context = (
                 f"The user's bank statement shows:\n"
-                f"- Total income: ${income:,.2f}\n"
-                f"- Total expenses: ${expenses_abs:,.2f}\n"
-                f"- Net balance: ${net:,.2f}\n"
-                f"- Top transactions: {', '.join(str(d) for d in top_desc)}\n"
+                f"- Total income / deposits: ${income:,.2f}\n"
+                f"- Total expenses / withdrawals: ${expenses_abs:,.2f}\n"
+                f"- Net balance change: ${net:,.2f}\n"
+                f"- Top spending transactions: {', '.join(str(d) for d in top_desc)}\n"
             )
         else:
             data_context = "No bank statement has been uploaded yet."
@@ -366,7 +491,7 @@ controller = ControllerAgent()
 
 st.header("1️⃣ Upload Your Bank Statement")
 uploaded = st.file_uploader(
-    "Upload a PDF or CSV bank statement (Chase, BofA, Wells Fargo, Citi, Capital One, etc.)",
+    "Upload a PDF or CSV bank statement (Chase, BofA, Wells Fargo, Navy Federal, Citi, Capital One, etc.)",
     type=["csv", "pdf"]
 )
 if uploaded is not None:
@@ -445,20 +570,16 @@ st.caption(
     "Ask anything about your finances — the AI Critic reads your actual statement data and answers like a personal finance advisor."
 )
 
-# Display chat history
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Chat input
 user_q = st.chat_input("Ask a finance question... e.g. 'Why are my expenses so high?' or 'How do I save more?'")
 if user_q:
-    # Show user message
     st.session_state.chat_history.append({"role": "user", "content": user_q})
     with st.chat_message("user"):
         st.markdown(user_q)
 
-    # Get AI response
     with st.chat_message("assistant"):
         with st.spinner("🧐 AI Critic is thinking..."):
             answer = critic.ask_ai(
