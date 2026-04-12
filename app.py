@@ -252,8 +252,8 @@ def parse_pdf_statement(uploaded_file):
 # AGENT CLASSES
 # ============================================================
 
-class DataFetcherAgent:
-    """Agent 1 – loads & normalises CSV or PDF bank statements."""
+class DataFetchAgent:
+    """Data Fetch Agent – loads & normalises CSV or PDF bank statements."""
     def fetch_data(self, uploaded_file):
         filename = uploaded_file.name.lower()
 
@@ -340,7 +340,7 @@ class DataFetcherAgent:
 
 
 class AnalyzerAgent:
-    """Agent 2 – computes income, expenses, and category breakdown."""
+    """Analyzer Agent – computes income, expenses, and category breakdown."""
     def analyze(self, df):
         if df is None or df.empty:
             return "No data loaded yet. Upload a file first.", None
@@ -383,7 +383,7 @@ class AnalyzerAgent:
 
 
 class PlannerAgent:
-    """Agent 3 – generates a simple budget plan."""
+    """Planner Agent – generates a simple budget plan."""
     def plan(self, df):
         if df is None or df.empty:
             return "Run Analyze first so I can see your spending."
@@ -497,13 +497,13 @@ class ControllerAgent:
             summary, new_df = analyzer.analyze(df)
             st.session_state.summary      = summary
             st.session_state.analyzed_df  = new_df
-            return f"✅ Analyzer ran!\n\n{summary}"
+            return f"✅ Analyzer Agent ran!\n\n{summary}"
         elif "plan" in cmd:
             if analyzed_df is None:
                 return "⚠️ Run Analyze first before planning."
             result = planner.plan(analyzed_df)
             st.session_state.plan = result
-            return f"✅ Planner ran!\n\n{result}"
+            return f"✅ Planner Agent ran!\n\n{result}"
         elif "critic" in cmd or "critique" in cmd or "review" in cmd:
             if analyzed_df is None:
                 return "⚠️ Run Analyze first so the Critic has data."
@@ -519,7 +519,7 @@ class ControllerAgent:
 
 
 # ---- Instantiate agents ----
-fetcher    = DataFetcherAgent()
+fetcher    = DataFetchAgent()
 analyzer   = AnalyzerAgent()
 planner    = PlannerAgent()
 critic     = CriticAgent()
